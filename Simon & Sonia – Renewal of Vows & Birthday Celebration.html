@@ -1,0 +1,892 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Simon & Sonia – Renewal of Vows & Birthday Celebration</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,500;0,600;1,300;1,400;1,500&family=EB+Garamond:ital,wght@0,400;0,500;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --gold:      #C9A030;
+    --dark-gold: #8B6500;
+    --mid-gold:  #B8860B;
+    --pale-gold: #F5E6C0;
+    --ivory:     #FFFDF5;
+    --cream:     #FAF4E8;
+    --brown:     #3B2510;
+    --mid-brown: #6B4C2A;
+    --light-brown: #9B7A52;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: var(--cream);
+    font-family: 'EB Garamond', serif;
+    color: var(--brown);
+    min-height: 100vh;
+    background-image:
+      radial-gradient(ellipse at 20% 20%, rgba(201,160,48,0.08) 0%, transparent 60%),
+      radial-gradient(ellipse at 80% 80%, rgba(201,160,48,0.06) 0%, transparent 60%);
+  }
+
+  /* ── Floating petals background ── */
+  .bg-petals {
+    position: fixed; inset: 0; pointer-events: none; overflow: hidden; z-index: 0;
+  }
+  .petal {
+    position: absolute;
+    opacity: 0.12;
+    animation: floatPetal linear infinite;
+    font-size: 1.4rem;
+  }
+  @keyframes floatPetal {
+    0%   { transform: translateY(100vh) rotate(0deg); opacity: 0; }
+    10%  { opacity: 0.12; }
+    90%  { opacity: 0.12; }
+    100% { transform: translateY(-10vh) rotate(360deg); opacity: 0; }
+  }
+
+  /* ── Main wrapper ── */
+  .page-wrap {
+    position: relative; z-index: 1;
+    max-width: 600px;
+    margin: 0 auto;
+    padding: 20px 16px 60px;
+  }
+
+  /* ── Card ── */
+  .card {
+    background: var(--ivory);
+    border: 1.5px solid var(--gold);
+    border-radius: 2px;
+    box-shadow:
+      0 0 0 6px var(--ivory),
+      0 0 0 7.5px var(--gold),
+      0 20px 60px rgba(139,101,0,0.18);
+    padding: 0;
+    overflow: hidden;
+    animation: fadeUp 1s ease both;
+  }
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(30px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .card-inner {
+    border: 1px solid rgba(201,160,48,0.35);
+    margin: 10px;
+    padding: 36px 28px 32px;
+  }
+
+  /* ── SVG corner ornaments ── */
+  .corners {
+    position: relative;
+  }
+  .corner-svg {
+    position: absolute;
+    width: 80px; height: 80px;
+    opacity: 0.85;
+  }
+  .corner-svg.tl { top: -4px;  left: -4px; }
+  .corner-svg.tr { top: -4px;  right: -4px;  transform: scaleX(-1); }
+  .corner-svg.bl { bottom: -4px; left: -4px;  transform: scaleY(-1); }
+  .corner-svg.br { bottom: -4px; right: -4px; transform: scale(-1,-1); }
+
+  /* ── Header ── */
+  .header { text-align: center; padding: 20px 40px 0; }
+
+  .top-ornament {
+    display: block; margin: 0 auto 14px;
+    color: var(--gold); font-size: 1.1rem;
+    letter-spacing: 6px;
+    animation: fadeUp 1s ease 0.2s both;
+  }
+
+  .main-title {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 2.2rem;
+    font-weight: 600;
+    font-style: italic;
+    color: var(--dark-gold);
+    line-height: 1.15;
+    animation: fadeUp 1s ease 0.3s both;
+  }
+
+  .subtitle {
+    font-family: 'EB Garamond', serif;
+    font-size: 1rem;
+    font-weight: 400;
+    color: var(--mid-brown);
+    margin-top: 6px;
+    letter-spacing: 0.5px;
+    animation: fadeUp 1s ease 0.4s both;
+  }
+
+  .in-honour {
+    font-size: 0.85rem;
+    color: var(--light-brown);
+    font-style: italic;
+    margin-top: 14px;
+    animation: fadeUp 1s ease 0.5s both;
+  }
+
+  .couple-names {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 1.7rem;
+    font-weight: 600;
+    color: var(--brown);
+    margin-top: 4px;
+    animation: fadeUp 1s ease 0.6s both;
+  }
+
+  /* ── Gold divider ── */
+  .divider {
+    display: flex; align-items: center; justify-content: center;
+    gap: 10px; margin: 18px auto;
+    animation: fadeUp 1s ease 0.5s both;
+  }
+  .divider-line {
+    flex: 1; max-width: 80px;
+    height: 1px; background: var(--gold);
+  }
+  .divider-gem {
+    color: var(--gold); font-size: 0.8rem;
+    transform: rotate(45deg); display: inline-block;
+  }
+
+  .thin-divider {
+    width: 120px; height: 1px;
+    background: linear-gradient(to right, transparent, var(--gold), transparent);
+    margin: 10px auto;
+  }
+
+  /* ── Section ── */
+  .section {
+    margin-top: 28px;
+    animation: fadeUp 1s ease 0.7s both;
+  }
+  .section + .section { margin-top: 32px; }
+
+  .section-header {
+    text-align: center; margin-bottom: 6px;
+  }
+
+  .section-tag {
+    display: inline-block;
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 1.15rem;
+    font-style: italic;
+    font-weight: 600;
+    color: var(--dark-gold);
+    letter-spacing: 1px;
+  }
+
+  .section-rule {
+    width: 60px; height: 1px;
+    background: var(--gold);
+    margin: 6px auto 18px;
+  }
+
+  /* ── Program items ── */
+  .program-list { list-style: none; }
+
+  .program-item {
+    text-align: center;
+    padding: 9px 12px;
+    border-bottom: 1px solid rgba(201,160,48,0.15);
+    transition: background 0.2s;
+  }
+  .program-item:last-child { border-bottom: none; }
+  .program-item:nth-child(even) { background: rgba(245,230,192,0.2); }
+  .program-item:hover { background: rgba(245,230,192,0.4); }
+
+  .item-title {
+    font-family: 'EB Garamond', serif;
+    font-size: 1rem;
+    font-weight: 500;
+    color: var(--brown);
+    display: block;
+    letter-spacing: 0.3px;
+  }
+
+  .item-name {
+    font-family: 'EB Garamond', serif;
+    font-size: 0.875rem;
+    font-style: italic;
+    color: var(--mid-brown);
+    display: block;
+    margin-top: 2px;
+  }
+
+  /* ── Bottom scripture ── */
+  .scripture {
+    text-align: center;
+    margin-top: 30px;
+    padding-top: 20px;
+    border-top: 1px solid rgba(201,160,48,0.3);
+    font-style: italic;
+    font-size: 0.875rem;
+    color: var(--mid-brown);
+    line-height: 1.6;
+    animation: fadeUp 1s ease 1s both;
+  }
+
+  .directors {
+    text-align: center;
+    margin-top: 16px;
+    font-size: 0.8rem;
+    color: var(--light-brown);
+    font-style: italic;
+    letter-spacing: 0.3px;
+  }
+
+  /* ── Bottom botanical ── */
+  .bottom-ornament {
+    text-align: center;
+    margin-top: 16px;
+    color: var(--gold);
+    font-size: 1rem;
+    letter-spacing: 4px;
+    opacity: 0.7;
+  }
+
+  /* ── QR Section ── */
+  .qr-section {
+    margin-top: 32px;
+    text-align: center;
+    padding: 24px 20px;
+    background: var(--ivory);
+    border: 1px solid rgba(201,160,48,0.35);
+    border-radius: 2px;
+    animation: fadeUp 1s ease 1.1s both;
+  }
+  .qr-label {
+    font-family: 'Cormorant Garamond', serif;
+    font-size: 1.05rem;
+    font-style: italic;
+    color: var(--dark-gold);
+    margin-bottom: 14px;
+  }
+  #qrcode {
+    display: inline-block;
+    padding: 10px;
+    background: white;
+    border: 1px solid var(--pale-gold);
+    box-shadow: 0 4px 16px rgba(139,101,0,0.12);
+  }
+  #qrcode canvas, #qrcode img { display: block; }
+  .qr-instruction {
+    font-size: 0.8rem;
+    color: var(--light-brown);
+    margin-top: 10px;
+    font-style: italic;
+  }
+
+  /* ── Responsive ── */
+  @media (max-width: 480px) {
+    .main-title { font-size: 1.75rem; }
+    .card-inner { padding: 28px 18px 24px; }
+    .corner-svg { width: 60px; height: 60px; }
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+
+<!-- Floating petals -->
+<div class="bg-petals" id="petals"></div>
+
+<div class="page-wrap">
+  <div class="card corners" id="mainCard">
+
+    <!-- Corner SVG ornaments -->
+    <svg class="corner-svg tl" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <g stroke="#C9A030" stroke-width="1" fill="none">
+        <path d="M8 8 Q20 12 36 8" stroke-width="1.2"/>
+        <path d="M8 8 Q12 20 8 36" stroke-width="1.2"/>
+        <path d="M8 8 Q18 18 28 28" stroke-width="1.2"/>
+        <!-- leaves right -->
+        <ellipse cx="20" cy="9" rx="5" ry="3" transform="rotate(-20 20 9)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="32" cy="7" rx="4" ry="2.5" transform="rotate(-15 32 7)" fill="#C9A030" stroke="none"/>
+        <!-- leaves up -->
+        <ellipse cx="9" cy="20" rx="3" ry="5" transform="rotate(20 9 20)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="7" cy="32" rx="2.5" ry="4" transform="rotate(15 7 32)" fill="#C9A030" stroke="none"/>
+        <!-- diagonal leaves -->
+        <ellipse cx="18" cy="18" rx="4" ry="2.5" transform="rotate(45 18 18)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="26" cy="26" rx="3.5" ry="2" transform="rotate(45 26 26)" fill="#C9A030" stroke="none"/>
+        <!-- berries -->
+        <circle cx="36" cy="7" r="2.5" fill="#C9A030" stroke="none"/>
+        <circle cx="7" cy="36" r="2.5" fill="#C9A030" stroke="none"/>
+        <circle cx="29" cy="29" r="2" fill="#C9A030" stroke="none"/>
+        <!-- curls -->
+        <path d="M36 7 Q40 8 39 12" stroke-width="0.8"/>
+        <path d="M7 36 Q8 40 12 39" stroke-width="0.8"/>
+      </g>
+    </svg>
+    <svg class="corner-svg tr" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <g stroke="#C9A030" stroke-width="1" fill="none">
+        <path d="M8 8 Q20 12 36 8" stroke-width="1.2"/>
+        <path d="M8 8 Q12 20 8 36" stroke-width="1.2"/>
+        <path d="M8 8 Q18 18 28 28" stroke-width="1.2"/>
+        <ellipse cx="20" cy="9" rx="5" ry="3" transform="rotate(-20 20 9)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="32" cy="7" rx="4" ry="2.5" transform="rotate(-15 32 7)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="9" cy="20" rx="3" ry="5" transform="rotate(20 9 20)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="7" cy="32" rx="2.5" ry="4" transform="rotate(15 7 32)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="18" cy="18" rx="4" ry="2.5" transform="rotate(45 18 18)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="26" cy="26" rx="3.5" ry="2" transform="rotate(45 26 26)" fill="#C9A030" stroke="none"/>
+        <circle cx="36" cy="7" r="2.5" fill="#C9A030" stroke="none"/>
+        <circle cx="7" cy="36" r="2.5" fill="#C9A030" stroke="none"/>
+        <circle cx="29" cy="29" r="2" fill="#C9A030" stroke="none"/>
+        <path d="M36 7 Q40 8 39 12" stroke-width="0.8"/>
+        <path d="M7 36 Q8 40 12 39" stroke-width="0.8"/>
+      </g>
+    </svg>
+    <svg class="corner-svg bl" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <g stroke="#C9A030" stroke-width="1" fill="none">
+        <path d="M8 8 Q20 12 36 8" stroke-width="1.2"/>
+        <path d="M8 8 Q12 20 8 36" stroke-width="1.2"/>
+        <path d="M8 8 Q18 18 28 28" stroke-width="1.2"/>
+        <ellipse cx="20" cy="9" rx="5" ry="3" transform="rotate(-20 20 9)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="32" cy="7" rx="4" ry="2.5" transform="rotate(-15 32 7)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="9" cy="20" rx="3" ry="5" transform="rotate(20 9 20)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="7" cy="32" rx="2.5" ry="4" transform="rotate(15 7 32)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="18" cy="18" rx="4" ry="2.5" transform="rotate(45 18 18)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="26" cy="26" rx="3.5" ry="2" transform="rotate(45 26 26)" fill="#C9A030" stroke="none"/>
+        <circle cx="36" cy="7" r="2.5" fill="#C9A030" stroke="none"/>
+        <circle cx="7" cy="36" r="2.5" fill="#C9A030" stroke="none"/>
+        <circle cx="29" cy="29" r="2" fill="#C9A030" stroke="none"/>
+        <path d="M36 7 Q40 8 39 12" stroke-width="0.8"/>
+        <path d="M7 36 Q8 40 12 39" stroke-width="0.8"/>
+      </g>
+    </svg>
+    <svg class="corner-svg br" viewBox="0 0 80 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <g stroke="#C9A030" stroke-width="1" fill="none">
+        <path d="M8 8 Q20 12 36 8" stroke-width="1.2"/>
+        <path d="M8 8 Q12 20 8 36" stroke-width="1.2"/>
+        <path d="M8 8 Q18 18 28 28" stroke-width="1.2"/>
+        <ellipse cx="20" cy="9" rx="5" ry="3" transform="rotate(-20 20 9)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="32" cy="7" rx="4" ry="2.5" transform="rotate(-15 32 7)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="9" cy="20" rx="3" ry="5" transform="rotate(20 9 20)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="7" cy="32" rx="2.5" ry="4" transform="rotate(15 7 32)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="18" cy="18" rx="4" ry="2.5" transform="rotate(45 18 18)" fill="#C9A030" stroke="none"/>
+        <ellipse cx="26" cy="26" rx="3.5" ry="2" transform="rotate(45 26 26)" fill="#C9A030" stroke="none"/>
+        <circle cx="36" cy="7" r="2.5" fill="#C9A030" stroke="none"/>
+        <circle cx="7" cy="36" r="2.5" fill="#C9A030" stroke="none"/>
+        <circle cx="29" cy="29" r="2" fill="#C9A030" stroke="none"/>
+        <path d="M36 7 Q40 8 39 12" stroke-width="0.8"/>
+        <path d="M7 36 Q8 40 12 39" stroke-width="0.8"/>
+      </g>
+    </svg>
+
+    <div class="card-inner">
+
+      <!-- Header -->
+      <div class="header">
+        <span class="top-ornament">✦ ─── ✦ ─── ✦</span>
+        <h1 class="main-title">Renewal of Vows</h1>
+        <p class="subtitle">70th &amp; 67th Birthday Celebration</p>
+        <p class="in-honour">In Honour of</p>
+        <p class="couple-names">Simon &amp; Sonia</p>
+      </div>
+
+      <div class="divider">
+        <div class="divider-line"></div>
+        <span class="divider-gem">◆</span>
+        <div class="divider-line"></div>
+      </div>
+
+      <!-- PART ONE -->
+      <div class="section">
+        <div class="section-header">
+          <span class="section-tag">✦ Part One ✦</span>
+          <div class="section-rule"></div>
+        </div>
+        <ul class="program-list">
+          <li class="program-item">
+            <span class="item-title">Opening Prayer</span>
+            <span class="item-name">Pastor B.K</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Blessing</span>
+            <span class="item-name">Pastor B.K Maluleke</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Congratulations</span>
+            <span class="item-name">Jambatani F</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Traditional Song</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Traditional Song</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Announcement</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Closure</span>
+            <span class="item-name">Pastor Maluleke</span>
+          </li>
+        </ul>
+      </div>
+
+      <div class="divider" style="margin-top:28px">
+        <div class="divider-line"></div>
+        <span class="divider-gem">◆</span>
+        <div class="divider-line"></div>
+      </div>
+
+      <!-- PART TWO -->
+      <div class="section">
+        <div class="section-header">
+          <span class="section-tag">✦ Part Two ✦</span>
+          <div class="section-rule"></div>
+        </div>
+        <ul class="program-list">
+          <li class="program-item">
+            <span class="item-title">Opening</span>
+            <span class="item-name">Magomani Moses</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Welcome</span>
+            <span class="item-name">Dr Shikolokolo H P</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Praise and Worship</span>
+            <span class="item-name">Shikolokolo T.G</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Introduction of Man of God</span>
+            <span class="item-name">Pastor Moses Magomani</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Word of God</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Birthday Wishes</span>
+            <span class="item-name">Mrs Baloyi Noria</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Friends</span>
+            <span class="item-name">Mrs Khosa M.M, Tshikani R.J &amp; Mrs C B Baloyi</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Colleagues</span>
+            <span class="item-name">Mpangela T.S &amp; Tshabane M S</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">We Fellowship With Him</span>
+            <span class="item-name">Pastor Shitlhavani T</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Grandchildren</span>
+            <span class="item-name">Mrs Valoyi P N &amp; Mavuyangwa P</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Children</span>
+            <span class="item-name">Mrs Nkuna T, Clyde, Eichhorn &amp; Wisani</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Siblings</span>
+            <span class="item-name">Mr Ntsenani John &amp; Makamu G.S</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Grand Parents</span>
+            <span class="item-name">Mr Mabasa S &amp; Mr Mc Nkatini</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Family Representative</span>
+            <span class="item-name">Mrs M Mnisi &amp; Prof O R Chauke</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Word of Support – Grannies Ministry</span>
+            <span class="item-name">Mrs Magomani F &amp; Tlharihani</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Retirees</span>
+            <span class="item-name">Mrs G Mathonsi</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Lobola Messenger</span>
+            <span class="item-name">Prof Babane T</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">SAPA</span>
+            <span class="item-name">Mr Magomani R J</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">SADTU</span>
+            <span class="item-name">Baloyi M</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">ANC</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Toast &amp; Cutting of Cake</span>
+            <span class="item-name">Pastor R.M</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Word by Headwoman</span>
+            <span class="item-name">Xifaxani</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Response</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Gifts</span>
+            <span class="item-name">Mrs Mboweni E</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Vote of Thanks</span>
+            <span class="item-name">Dr D Chauke</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Announcement</span>
+            <span class="item-name">Bamuza Ethel</span>
+          </li>
+          <li class="program-item">
+            <span class="item-title">Closure</span>
+            <span class="item-name">Pastor Magomani T F</span>
+          </li>
+        </ul>
+      </div>
+
+      <!-- Scripture -->
+      <div class="scripture">
+        <p>"What God has joined together, let no one separate."</p>
+        <p style="margin-top:4px; font-size:0.8rem; color:var(--gold);">— Mark 10:9</p>
+      </div>
+
+      <p class="directors">Program Directors: Baloyi M &amp; Mahungu E</p>
+
+      <div class="bottom-ornament">✦ ─── ✦ ─── ✦</div>
+
+      <!-- QR Code Section -->
+      <div class="qr-section" style="margin-top:28px;">
+        <p class="qr-label">📱 Scan to view the digital program</p>
+        <div id="qrcode"></div>
+        <p class="qr-instruction">Share this QR code so guests can follow along on their phones</p>
+      </div>
+
+    </div><!-- card-inner -->
+  </div><!-- card -->
+</div><!-- page-wrap -->
+
+<!-- QR Code library -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<script>
+  // ── Floating petals ──
+  const petalContainer = document.getElementById('petals');
+  const symbols = ['✦','❋','✿','❀','✾'];
+  for (let i = 0; i < 14; i++) {
+    const p = document.createElement('span');
+    p.className = 'petal';
+    p.textContent = symbols[Math.floor(Math.random() * symbols.length)];
+    p.style.left = Math.random() * 100 + 'vw';
+    p.style.animationDuration = (18 + Math.random() * 20) + 's';
+    p.style.animationDelay = (Math.random() * 20) + 's';
+    p.style.fontSize = (0.8 + Math.random() * 1) + 'rem';
+    petalContainer.appendChild(p);
+  }
+
+  // ── QR Code ──
+  // Points to this page's current URL (works when hosted anywhere)
+  const url = window.location.href;
+  new QRCode(document.getElementById('qrcode'), {
+    text: url,
+    width: 160,
+    height: 160,
+    colorDark: '#8B6500',
+    colorLight: '#FFFDF5',
+    correctLevel: QRCode.CorrectLevel.M
+  });
+</script>
+</body>
+</html>
